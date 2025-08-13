@@ -276,7 +276,202 @@ resource "aws_kms_key" "kms_key" {
     coalesce(var.tags, {})
   )
 }
+######################################################################################################
 
+1) Variables (keep names flexible)
+
+variable "key_admins" {
+  description = "Admins for the KMS key (role names or ARNs)"
+  type        = list(string)
+  default     = []
+}
+
+variable "key_users" {
+  description = "Users of the KMS key (role names or ARNs)"
+  type        = list(string)
+  default     = []
+}
+
+variable "enable_ecr_viaservice" {
+  description = "Also allow ECR via kms:ViaService (recommended)"
+  type        = bool
+  default     = true
+}
+2) Facts + normalization locals
+
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+  partition  = data.aws_partition.current.partition
+  region     = data.aws_region.current.name
+  arn_prefix = "arn:${local.partition}:iam::${local.account_id}"
+
+  # Convert names -> ARNs, keep ARNs as-is, drop empties
+  admins_arns = [
+    for x in compact(var.key_admins) :
+    startswith(x, "arn:") ? x : "${local.arn_prefix}:role/${x}"
+  ]
+
+  users_arns = [
+    for x in compact(var.key_users) :
+    startswith(x, "arn:") ? x : "${local.arn_prefix}:role/${x}"
+  ]
+}
+3) Key policy that mirrors your JSON (safe)
+
+data "aws_iam_policy_document" "kms_key_policy" {
+  # Root admin (required)
+  statement {
+    sid     = "EnableIAMUserPermissions"
+    effect  = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = ["${local.arn_prefix}:root"]
+    }
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  # Key Administrators
+  dynamic "statement" {
+    for_each = length(local.admins_arns) > 0 ? [1] : []
+    content {
+      sid    = "AllowAccessForKeyAdministrators"
+      effect = "Allow"
+      principals {
+        type        = "AWS"
+        identifiers = local.admins_arns
+      }
+      actions = [
+        "kms:DescribeKey",
+        "kms:Get*",
+        "kms:List*",
+        "kms:Update*",
+        "kms:Create*",
+        "kms:Enable*",
+        "kms:Disable*",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:RevokeGrant",
+        "kms:PutKeyPolicy"
+      ]
+      resources = ["*"]
+    }
+  }
+
+  # Allow use of the key (your list of roles, including service-linked roles)
+  dynamic "statement" {
+    for_each = length(local.users_arns) > 0 ? [1] : []
+    content {
+      sid    = "AllowUseOfTheKey"
+      effect = "Allow"
+      principals {
+        type        = "AWS"
+        identifiers = local.users_arns
+      }
+      actions = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ]
+      resources = ["*"]
+    }
+  }
+
+  # Allow attachment of persistent resources (grant block)
+  dynamic "statement" {
+    for_each = length(local.users_arns) > 0 ? [1] : []
+    content {
+      sid    = "AllowAttachmentOfPersistentResources"
+      effect = "Allow"
+      principals {
+        type        = "AWS"
+        identifiers = local.users_arns
+      }
+      actions   = ["kms:CreateGrant", "kms:ListGrants", "kms:RevokeGrant"]
+      resources = ["*"]
+      condition {
+        test     = "Bool"
+        variable = "kms:GrantIsForAWSResource"
+        values   = ["true"]
+      }
+    }
+  }
+
+  # Recommended: allow ECR via service (so you don't have to enumerate ECR SLRs)
+  dynamic "statement" {
+    for_each = var.enable_ecr_viaservice ? [1] : []
+    content {
+      sid    = "AllowECRViaService"
+      effect = "Allow"
+      principals {
+        type        = "AWS"
+        identifiers = ["*"]
+      }
+      actions = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ]
+      resources = ["*"]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:CallerAccount"
+        values   = [local.account_id]
+      }
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["ecr.${local.region}.amazonaws.com"]
+      }
+    }
+  }
+}
+Create the key with that policy
+
+resource "aws_kms_key" "ecr" {
+  description             = "ECR encryption key"
+  key_usage               = "ENCRYPT_DECRYPT"
+  enable_key_rotation     = true
+  deletion_window_in_days = 7
+  policy                  = data.aws_iam_policy_document.kms_key_policy.json
+}
+How to pass the exact roles from your screenshot
+Just give them as role names or ARNs—this module accepts both:
+
+
+module "ecr_kms" {
+  source = "./path/to/this-module"
+
+  key_admins = [
+    # your deployer admin role (name or ARN)
+    "iam-1-g-deployeraccount-mqzz"
+  ]
+
+  key_users = [
+    # service-linked roles (write exact names after 'role/')
+    "aws-service-role/ecr.amazonaws.com/AWSServiceRoleForECRTemplate",
+    "aws-service-role/pullthroughcache.ecr.amazonaws.com/AWSServiceRoleForECRPullThroughCache",
+    "aws-service-role/cloudtrail.amazonaws.com/AWSServiceRoleForCloudTrail",
+
+    # your workload roles
+    "AmazonEKSNodeRoleFcts",
+    "AmazonEKSAutoNodeRole",
+    "AmazonEKSAutoClusterRole_test"
+  ]
+
+  # optional: also allow ECR via kms:ViaService
+  enable_ecr_viaservice = true
+}
 
 
 
