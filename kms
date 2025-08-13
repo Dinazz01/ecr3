@@ -1,0 +1,284 @@
+How to fix this
+You need to sanitize and normalize those lists before they get to principals { ... identifiers = [...] }.
+
+1️⃣ Normalize your key users/admins before passing into the policy
+At the top of the file (or in a shared locals block):
+
+
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+  partition  = data.aws_partition.current.partition
+  arn_prefix = "arn:${local.partition}:iam::${local.account_id}"
+
+  normalize_iam_arns = [
+    for x in compact(var.key_users) : (
+      startswith(x, "arn:") ? x : format("%s:role/%s", local.arn_prefix, x)
+    )
+  ]
+
+  normalize_admin_arns = [
+    for x in compact(var.key_admins) : (
+      startswith(x, "arn:") ? x : format("%s:role/%s", local.arn_prefix, x)
+    )
+  ]
+}
+compact(...) removes empty strings,
+startswith(x, "arn:") ? x : ... keeps valid ARNs as-is and converts role names into ARNs.
+
+2️⃣ Use those locals in your KMS policy statements
+
+# Admins
+dynamic "statement" {
+  for_each = length(local.normalize_admin_arns) > 0 ? [1] : []
+  content {
+    sid = "AllowKeyAdmins"
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = local.normalize_admin_arns
+    }
+    actions = [
+      "kms:DescribeKey",
+      "kms:Get*",
+      "kms:List*",
+      "kms:Create*",
+      "kms:Enable*",
+      "kms:Disable*",
+      "kms:ScheduleKeyDeletion",
+      "kms:CancelKeyDeletion"
+    ]
+    resources = ["*"]
+  }
+}
+
+# Users
+dynamic "statement" {
+  for_each = length(local.normalize_iam_arns) > 0 ? [1] : []
+  content {
+    sid = "AllowKeyUsers"
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = local.normalize_iam_arns
+    }
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+  }
+}
+3️⃣ If ECR needs to use the key
+For ECR or any AWS service, don’t put ecr.amazonaws.com in type = "AWS".
+Instead, use "*" principal and the kms:ViaService condition:
+
+
+statement {
+  sid = "AllowECRServiceUse"
+  effect = "Allow"
+  principals {
+    type        = "AWS"
+    identifiers = ["*"]
+  }
+  actions = [
+    "kms:Encrypt",
+    "kms:Decrypt",
+    "kms:ReEncrypt*",
+    "kms:GenerateDataKey*",
+    "kms:DescribeKey"
+  ]
+  resources = ["*"]
+  condition {
+    test     = "StringEquals"
+    variable = "kms:ViaService"
+    values   = ["ecr.${var.region}.amazonaws.com"]
+  }
+  condition {
+    test     = "StringEquals"
+    variable = "kms:CallerAccount"
+    values   = [local.account_id]
+  }
+}
+===========================================================================================
+
+1) Data + locals (put near the top of the file)
+
+# Facts
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+  partition  = data.aws_partition.current.partition
+  region     = data.aws_region.current.name
+  arn_prefix = "arn:${local.partition}:iam::${local.account_id}"
+
+  # Accept names or ARNs; drop empties
+  # key_admins / key_users are your existing variables
+  key_admins_norm = [
+    for x in compact(coalesce(var.key_admins, [])) :
+    startswith(x, "arn:") ? x : "${local.arn_prefix}:role/${x}"
+  ]
+
+  key_users_norm = [
+    for x in compact(coalesce(var.key_users, [])) :
+    startswith(x, "arn:") ? x : "${local.arn_prefix}:role/${x}"
+  ]
+}
+Variables expected (keep your names):
+
+
+variable "key_admins" { type = list(string) default = [] } # role names or ARNs
+variable "key_users"  { type = list(string) default = [] } # role names or ARNs
+2) KMS key policy document (safe, service-aware)
+hcl
+Copy
+Edit
+data "aws_iam_policy_document" "key_policy" {
+  # 0) Required: root of the owning account gets full control
+  statement {
+    sid     = "EnableIAMUserPermissions"
+    effect  = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = ["${local.arn_prefix}:root"]
+    }
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  # 1) Admins (full admin on key mgmt)
+  dynamic "statement" {
+    for_each = length(local.key_admins_norm) > 0 ? [1] : []
+    content {
+      sid    = "AllowDirectAccessToKMSKey"
+      effect = "Allow"
+      principals {
+        type        = "AWS"
+        identifiers = local.key_admins_norm
+      }
+      actions = [
+        "kms:DescribeKey",
+        "kms:Get*",
+        "kms:List*",
+        "kms:Create*",
+        "kms:Enable*",
+        "kms:Disable*",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:PutKeyPolicy",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:RevokeGrant"
+      ]
+      resources = ["*"]
+    }
+  }
+
+  # 2) Users (cryptographic use)
+  dynamic "statement" {
+    for_each = length(local.key_users_norm) > 0 ? [1] : []
+    content {
+      sid    = "AllowUseOfTheKMSKey"
+      effect = "Allow"
+      principals {
+        type        = "AWS"
+        identifiers = local.key_users_norm
+      }
+      actions = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ]
+      resources = ["*"]
+    }
+  }
+
+  # 3) Users allowed to create KMS grants for AWS resources (persistent resources)
+  dynamic "statement" {
+    for_each = length(local.key_users_norm) > 0 ? [1] : []
+    content {
+      sid    = "AllowAttachmentOfPersistentResources"
+      effect = "Allow"
+      principals {
+        type        = "AWS"
+        identifiers = local.key_users_norm
+      }
+      actions = [
+        "kms:CreateGrant",
+        "kms:ListGrants",
+        "kms:RevokeGrant"
+      ]
+      resources = ["*"]
+      condition {
+        test     = "Bool"
+        variable = "kms:GrantIsForAWSResource"
+        values   = ["true"]
+      }
+    }
+  }
+
+  # 4) Allow **ECR** to use the key in this account/region (service access done right)
+  statement {
+    sid    = "AllowECRViaService"
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:CallerAccount"
+      values   = [local.account_id]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ecr.${local.region}.amazonaws.com"]
+    }
+  }
+}
+Notes
+• We never put ecr.amazonaws.com in principals—that’s what trips MalformedPolicyDocument.
+• All key_admins / key_users are compact()’d and converted to ARNs if they’re just names.
+• The “GrantIsForAWSResource” block mirrors what you had, just using the normalized lists.
+
+3) Create the key using this policy
+If you build the key directly:
+
+
+resource "aws_kms_key" "kms_key" {
+  description             = coalesce(var.kms_key_description, "ECR encryption key")
+  key_usage               = "ENCRYPT_DECRYPT"
+  enable_key_rotation     = true
+  deletion_window_in_days = 7
+  policy                  = data.aws_iam_policy_document.key_policy.json
+
+  tags = merge(
+    { Name = coalesce(var.kms_key_name, "kms-key") },
+    coalesce(var.tags, {})
+  )
+}
+
+
+
+
+
+
