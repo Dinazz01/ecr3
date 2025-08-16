@@ -1,0 +1,147 @@
+
+aws_secretsmanager_secret doesn’t take secret_string.
+You need two resources: the secret and its version.
+
+Make the Docker Hub creds optional and only create them (and the rule) when you actually enable the cache.
+
+Pass the secret ARN directly to the rule (no extra data source), and attach a Secrets Manager resource policy so ECR can read it.
+
+Keep your generic “rules map” so callers can add other upstreams (GHCR, Quay, etc.), each with or without credentials.
+
+Below are drop-in patches you can paste into your module.
+
+variables.tf (or add to what you have)
+variable "enable_pull_through_cache" { type = bool   default = false }
+
+# Simple Docker Hub toggle (optional convenience)
+variable "enable_dockerhub_cache" { type = bool default = false }
+variable "pull_through_prefix"    { type = string default = "dockerhub" } # e.g. "dockerhub"
+variable "docker_hub_username"    { type = string default = null }
+variable "docker_hub_access_token"{
+  type      = string
+  default   = null
+  sensitive = true
+}
+
+# Advanced: arbitrary upstream rules callers can provide
+variable "registry_pull_through_cache_rules" {
+  description = <<EOT
+Map of upstream rules. Key is an id (e.g. "dockerhub").
+Each value:
+{
+  ecr_repository_prefix = string
+  upstream_registry_url = string
+  credential_arn        = optional(string) # Secrets Manager ARN with JSON {"username":"","accessToken":""}
+}
+EOT
+  type = map(object({
+    ecr_repository_prefix = string
+    upstream_registry_url = string
+    credential_arn        = optional(string)
+  }))
+  default = {}
+}
+
+main.tf – Docker Hub secret (optional, correct 2-resource pattern)
+# Create a secret only if explicitly enabled AND creds provided
+resource "aws_secretsmanager_secret" "dockerhub" {
+  count      = var.enable_pull_through_cache && var.enable_dockerhub_cache
+               && var.docker_hub_username != null && var.docker_hub_access_token != null ? 1 : 0
+  name       = "ecr-pullthroughcache/dockerhub-creds"
+  description = "Docker Hub credentials for ECR pull-through cache"
+  # kms_key_id = var.kms_key_id_for_secrets   # optional if you want a CMK
+  tags = { purpose = "ecr-pullthrough" }
+}
+
+resource "aws_secretsmanager_secret_version" "dockerhub" {
+  count        = length(aws_secretsmanager_secret.dockerhub) > 0 ? 1 : 0
+  secret_id    = aws_secretsmanager_secret.dockerhub[0].id
+  secret_string = jsonencode({
+    username    = var.docker_hub_username
+    accessToken = var.docker_hub_access_token
+  })
+}
+
+# Allow the ECR service to read this secret (required when using credential_arn)
+resource "aws_secretsmanager_secret_policy" "dockerhub_allow_ecr" {
+  count     = length(aws_secretsmanager_secret.dockerhub) > 0 ? 1 : 0
+  secret_arn = aws_secretsmanager_secret.dockerhub[0].arn
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Sid      = "AllowECRToReadSecret",
+      Effect   = "Allow",
+      Principal = { Service = "ecr.amazonaws.com" },
+      Action   = ["secretsmanager:GetSecretValue","secretsmanager:DescribeSecret"],
+      Resource = aws_secretsmanager_secret.dockerhub[0].arn,
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+      }
+    }]
+  })
+}
+
+locals {
+  dockerhub_credential_arn = try(aws_secretsmanager_secret.dockerhub[0].arn, null)
+
+  # Compose the effective rule set:
+  #  - caller-provided map
+  #  - optional Docker Hub rule if enabled
+  effective_pullthrough_rules = var.enable_pull_through_cache ? merge(
+    var.registry_pull_through_cache_rules,
+    var.enable_dockerhub_cache ? {
+      dockerhub = {
+        ecr_repository_prefix = var.pull_through_prefix
+        upstream_registry_url = "https://registry-1.docker.io"
+        credential_arn        = local.dockerhub_credential_arn
+      }
+    } : {}
+  ) : {}
+}
+
+# Create one ECR rule per entry (credential_arn is optional)
+resource "aws_ecr_pull_through_cache_rule" "this" {
+  for_each = local.effective_pullthrough_rules
+
+  ecr_repository_prefix = each.value.ecr_repository_prefix
+  upstream_registry_url = each.value.upstream_registry_url
+  credential_arn        = try(each.value.credential_arn, null)
+}
+
+
+Notes
+• Your earlier code had secret string on aws_secretsmanager_secret—that’s why Terraform complained. The value belongs on aws_secretsmanager_secret_version.
+• custom_role_arn is not a valid argument on aws_ecr_pull_through_cache_rule; remove it.
+• If you don’t want Docker Hub at all, just set enable_dockerhub_cache = false (default) and/or don’t pass creds—no secret or rule will be created.
+
+Example usages
+
+A) Turn on Docker Hub cache (public images, no creds):
+
+enable_pull_through_cache = true
+enable_dockerhub_cache    = true
+# no username/token needed for public pulls
+
+
+B) Docker Hub with higher rate limits (creds):
+
+enable_pull_through_cache = true
+enable_dockerhub_cache    = true
+docker_hub_username       = var.docker_hub_username
+docker_hub_access_token   = var.docker_hub_access_token
+
+
+C) Add GHCR too (with its own secret you created elsewhere):
+
+enable_pull_through_cache = true
+registry_pull_through_cache_rules = {
+  ghcr = {
+    ecr_repository_prefix = "ghcr"
+    upstream_registry_url = "https://ghcr.io"
+    credential_arn        = "arn:aws:secretsmanager:us-east-1:123456789012:secret:ghcr-creds-xxxxx"
+  }
+}
+
+
+That will cleanly fix the error you saw, keep credentials secure, and let consumers add more upstream caches without changing the module again. If you want me to wire t
